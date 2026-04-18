@@ -375,7 +375,7 @@ def create_pipeline(config: Optional[Config] = None):
             gate_name="sandbox",
             passed=result.success,
             findings=_sandbox_to_findings(result),
-            details=result.stdout[:2000] if result.stdout else None,
+            details=_truncate_sandbox_output(result.stdout, result.stderr),
         )
 
         prior_gates = state.get("gate_results") or []
@@ -560,7 +560,7 @@ def create_pipeline(config: Optional[Config] = None):
         else:
             final_output = state.get("generated_tests") if state["verification_passed"] else state.get("generated_tests")
 
-        audit_logger.save(state["audit_log"], state.get("file_path", "unknown"))
+        audit_logger.save(state["audit_log"], state.get("file_path") or "unknown")
 
         return {
             **state,
@@ -606,6 +606,32 @@ def create_pipeline(config: Optional[Config] = None):
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
+
+def _truncate_sandbox_output(stdout: Optional[str], stderr: Optional[str],
+                             head: int = 1500, tail: int = 6500) -> Optional[str]:
+    """Return a truncated view of pytest output that preserves the end.
+
+    Pytest prints failures and the summary at the end of stdout, so a naive
+    head-only truncation hides the information repair needs. We keep a small
+    header plus the tail of stdout and append stderr if present.
+    """
+    combined = (stdout or "")
+    if stderr:
+        combined += "\n--- stderr ---\n" + stderr
+
+    if not combined:
+        return None
+
+    max_len = head + tail + 50
+    if len(combined) <= max_len:
+        return combined
+
+    return (
+        combined[:head]
+        + f"\n\n... [truncated {len(combined) - head - tail} chars] ...\n\n"
+        + combined[-tail:]
+    )
+
 
 def _sandbox_to_findings(result) -> List[Finding]:
     """Convert sandbox ExecutionResult errors into Finding objects."""

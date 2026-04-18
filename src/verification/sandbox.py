@@ -2,6 +2,7 @@
 
 import os
 import re
+import sys
 import tempfile
 import shutil
 from typing import Optional
@@ -9,6 +10,28 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from ..config import SandboxConfig
+
+
+_STDLIB_MODULES = set(getattr(sys, "stdlib_module_names", set()))
+
+_COMMON_TEST_AND_THIRD_PARTY = {
+    "pytest", "unittest", "mock", "typing", "hypothesis", "coverage",
+    "numpy", "pandas", "scipy", "sklearn", "matplotlib",
+    "requests", "httpx", "aiohttp", "urllib3", "websockets",
+    "pydantic", "attrs", "dataclasses", "click", "typer", "rich",
+    "flask", "django", "fastapi", "starlette", "werkzeug", "jinja2",
+    "sqlalchemy", "alembic", "redis", "pymongo", "psycopg2", "pymysql",
+    "yaml", "toml", "msgpack", "lxml", "bs4", "beautifulsoup4",
+    "PIL", "cv2", "scikit-learn",
+    "freezegun", "responses", "faker", "factory_boy", "vcr",
+    "langchain", "langchain_core", "langchain_groq", "langgraph",
+}
+
+
+def _is_known_import(module: str) -> bool:
+    """Return True if the module is stdlib or a known third-party package."""
+    root = module.split(".")[0]
+    return root in _STDLIB_MODULES or root in _COMMON_TEST_AND_THIRD_PARTY
 
 
 class ExecutionResult(BaseModel):
@@ -187,13 +210,14 @@ class SandboxExecutor:
                 self.config.image_name,
                 command=[
                     "pytest", "-v", "--tb=short",
+                    "-p", "no:cacheprovider",
                     "--cov=source_module", "--cov-report=term-missing",
                     "test_generated.py",
                 ],
                 volumes={
                     str(workdir.absolute()): {
                         "bind": "/workspace",
-                        "mode": "ro",
+                        "mode": "rw",
                     }
                 },
                 working_dir="/workspace",
@@ -266,6 +290,7 @@ class SandboxExecutor:
             result = subprocess.run(
                 [
                     "pytest", "-v", "--tb=short",
+                    "-p", "no:cacheprovider",
                     "--cov=source_module", "--cov-report=term-missing",
                     "test_generated.py",
                 ],
@@ -323,44 +348,53 @@ class SandboxExecutor:
         )
     
     def _fix_imports(self, test_code: str) -> str:
-        """Fix import statements to use source_module instead of original paths.
-        
-        Args:
-            test_code: Generated test code
-            
-        Returns:
-            Test code with fixed imports
+        """Rewrite imports that reference the generated source module.
+
+        Strategy: only rewrite imports whose root module is NOT a known
+        stdlib/third-party package. Everything else (unittest.mock, tempfile,
+        os, json, numpy, ...) is preserved untouched.
         """
-        lines = test_code.split('\n')
+        lines = test_code.split("\n")
         fixed_lines = []
         has_source_import = False
-        
+
+        from_re = re.compile(r"^(\s*)from\s+([\w\.]+)\s+import\s+(.+?)\s*$")
+        import_re = re.compile(r"^(\s*)import\s+([\w\.]+)(\s+as\s+\w+)?\s*$")
+
         for line in lines:
-            stripped = line.strip()
-            if stripped.startswith('from ') and ' import ' in stripped:
-                if 'source_module' in stripped:
+            from_match = from_re.match(line)
+            if from_match:
+                indent, module, _names = from_match.groups()
+                root = module.split(".")[0]
+                if root == "source_module":
                     has_source_import = True
                     fixed_lines.append(line)
-                elif stripped.startswith('from pytest') or stripped.startswith('from typing'):
-                    fixed_lines.append(line)
-                else:
-                    has_source_import = True
-                    fixed_lines.append('from source_module import *')
-            elif stripped.startswith('import ') and not stripped.startswith('import pytest'):
-                if 'source_module' in stripped:
-                    has_source_import = True
+                elif _is_known_import(module):
                     fixed_lines.append(line)
                 else:
                     has_source_import = True
-                    fixed_lines.append('from source_module import *')
-            else:
-                fixed_lines.append(line)
-        
-        result = '\n'.join(fixed_lines)
-        
+                    fixed_lines.append(f"{indent}from source_module import *")
+                continue
+
+            import_match = import_re.match(line)
+            if import_match:
+                indent, module, _alias = import_match.groups()
+                root = module.split(".")[0]
+                if root == "source_module":
+                    has_source_import = True
+                    fixed_lines.append(line)
+                elif _is_known_import(module):
+                    fixed_lines.append(line)
+                else:
+                    has_source_import = True
+                    fixed_lines.append(f"{indent}from source_module import *")
+                continue
+
+            fixed_lines.append(line)
+
+        result = "\n".join(fixed_lines)
         if not has_source_import:
-            result = 'from source_module import *\n\n' + result
-        
+            result = "from source_module import *\n\n" + result
         return result
     
     def execute(

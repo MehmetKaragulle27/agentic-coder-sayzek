@@ -30,7 +30,7 @@ class AuditLogger:
             Unique filename
         """
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_name = source_identifier.replace("/", "_").replace("\\", "_").replace(".", "_")
+        safe_name = (source_identifier or "unknown").replace("/", "_").replace("\\", "_").replace(".", "_")
         if len(safe_name) > 50:
             safe_name = safe_name[:50]
         return f"{timestamp}_{safe_name}.json"
