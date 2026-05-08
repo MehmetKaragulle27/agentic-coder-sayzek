@@ -134,6 +134,213 @@ class TestDepHallucinationDataset:
             assert c.metadata["phantom_packages"] == []
 
 
+class TestProjectTestLoader:
+    """Regression tests for ProjectTest multi-file concatenation.
+
+    Bugs this guards against:
+    - Intra-project imports (``from blackjack.base import Card``) survived
+      concatenation and then failed with ``No module named 'blackjack'``.
+    - ``from __future__ import X`` from a non-first file landed in the middle
+      of the combined module, raising
+      ``SyntaxError: from __future__ imports must occur at the beginning``.
+    """
+
+    def _build_fake_project(self, tmp_path, name: str, files: dict):
+        """Create ``tmp_path/ProjectTest/dataset/Python/<name>/{files}``."""
+        project_dir = tmp_path / "ProjectTest" / "dataset" / "Python" / name
+        project_dir.mkdir(parents=True)
+        for filename, content in files.items():
+            (project_dir / filename).write_text(content, encoding="utf-8")
+        return tmp_path
+
+    def test_intra_project_imports_are_stripped(self, tmp_path):
+        from src.evaluation.benchmarks.projecttest import ProjectTestDataset
+
+        data_dir = self._build_fake_project(
+            tmp_path,
+            "blackjack",
+            {
+                "__init__.py": "from blackjack.base import Card as Card\n",
+                "base.py": "class Card:\n    pass\n",
+                "game.py": (
+                    "from blackjack.base import Card\n"
+                    "import blackjack.base\n"
+                    "def deal():\n    return Card()\n"
+                ),
+            },
+        )
+        ds = ProjectTestDataset(data_dir=data_dir, language_filter="python")
+        ds.download = lambda: data_dir  # skip git clone
+        cases = ds.load()
+        assert len(cases) == 1
+        combined = cases[0].code
+        # intra-project imports must be gone
+        assert "from blackjack.base" not in combined
+        assert "import blackjack.base" not in combined
+        # but the actual class definition is preserved
+        assert "class Card" in combined
+
+    def test_future_imports_are_hoisted(self, tmp_path):
+        from src.evaluation.benchmarks.projecttest import ProjectTestDataset
+
+        data_dir = self._build_fake_project(
+            tmp_path,
+            "mypkg",
+            {
+                "a.py": "def a(): return 1\n",  # no future import
+                "b.py": (
+                    "from __future__ import unicode_literals\n"
+                    "def b(): return 2\n"
+                ),
+                "c.py": (
+                    "from __future__ import absolute_import, division\n"
+                    "def c(): return 3\n"
+                ),
+            },
+        )
+        ds = ProjectTestDataset(data_dir=data_dir, language_filter="python")
+        ds.download = lambda: data_dir
+        cases = ds.load()
+        assert len(cases) == 1
+        combined = cases[0].code
+        # The hoisted header must be the FIRST non-blank, non-comment line.
+        # Otherwise Python will complain about future imports not being first.
+        assert combined.startswith("from __future__ import")
+        # All three features collected, dedup'd and sorted
+        first_line = combined.splitlines()[0]
+        assert "absolute_import" in first_line
+        assert "division" in first_line
+        assert "unicode_literals" in first_line
+        # And the combined source must actually be parseable
+        import ast
+        ast.parse(combined)
+
+    def test_external_imports_are_preserved(self, tmp_path):
+        from src.evaluation.benchmarks.projecttest import ProjectTestDataset
+
+        data_dir = self._build_fake_project(
+            tmp_path,
+            "myproj",
+            {
+                "core.py": (
+                    "import numpy as np\n"
+                    "from collections import Counter\n"
+                    "def f(): return Counter()\n"
+                ),
+            },
+        )
+        ds = ProjectTestDataset(data_dir=data_dir, language_filter="python")
+        ds.download = lambda: data_dir
+        cases = ds.load()
+        assert len(cases) == 1
+        combined = cases[0].code
+        assert "import numpy as np" in combined
+        assert "from collections import Counter" in combined
+
+    def test_aliased_intra_project_import_becomes_local_alias(self, tmp_path):
+        # Regression: `from pkg.dealer import BlackjackDealer as Dealer`
+        # was being dropped entirely, so downstream `Dealer(...)` raised
+        # NameError. Now it should become `Dealer = BlackjackDealer`.
+        from src.evaluation.benchmarks.projecttest import ProjectTestDataset
+
+        data_dir = self._build_fake_project(
+            tmp_path,
+            "blackjack",
+            {
+                "dealer.py": "class BlackjackDealer:\n    pass\n",
+                "game.py": (
+                    "from blackjack.dealer import BlackjackDealer as Dealer\n"
+                    "class Game:\n"
+                    "    def init(self):\n"
+                    "        self.dealer = Dealer()\n"
+                ),
+            },
+        )
+        ds = ProjectTestDataset(data_dir=data_dir, language_filter="python")
+        ds.download = lambda: data_dir
+        cases = ds.load()
+        combined = cases[0].code
+        # The alias assignment is present
+        assert "Dealer = BlackjackDealer" in combined
+        # And the combined module actually runs (Dealer is defined at import
+        # time so we can instantiate Game().init() without NameError).
+        ns: dict = {}
+        exec(compile(combined, "<combined>", "exec"), ns)
+        g = ns["Game"]()
+        g.init()
+        assert isinstance(g.dealer, ns["BlackjackDealer"])
+
+    def test_init_py_runs_last_so_reexport_aliases_resolve(self, tmp_path):
+        # Regression: rlcard-style projects put re-exports in __init__.py:
+        #     from blackjack.dealer import BlackjackDealer as Dealer
+        # After rewriting this becomes ``Dealer = BlackjackDealer``, which
+        # MUST run after ``class BlackjackDealer`` has been defined in
+        # dealer.py. But __init__.py sorts alphabetically FIRST (``_`` < ``d``),
+        # so the naive layout evaluates the alias before the class exists.
+        # We fix this by always emitting __init__.py LAST.
+        from src.evaluation.benchmarks.projecttest import ProjectTestDataset
+
+        data_dir = self._build_fake_project(
+            tmp_path,
+            "blackjack",
+            {
+                "__init__.py": (
+                    "from blackjack.dealer import BlackjackDealer as Dealer\n"
+                    "from blackjack.game import BlackjackGame as Game\n"
+                ),
+                "dealer.py": "class BlackjackDealer:\n    pass\n",
+                "game.py": "class BlackjackGame:\n    pass\n",
+            },
+        )
+        ds = ProjectTestDataset(data_dir=data_dir, language_filter="python")
+        ds.download = lambda: data_dir
+        cases = ds.load()
+        combined = cases[0].code
+        # The combined module must actually execute cleanly.
+        ns: dict = {}
+        exec(compile(combined, "<combined>", "exec"), ns)
+        assert ns["Dealer"] is ns["BlackjackDealer"]
+        assert ns["Game"] is ns["BlackjackGame"]
+
+    def test_submodule_as_namespace_is_synthesised(self, tmp_path):
+        # Regression: `from pkg import utils; @utils.check_for_none`
+        # failed with `NameError: 'utils' is not defined`. Now we synth
+        # a SimpleNamespace and back-fill it with the top-level names that
+        # came from ``utils.py``.
+        from src.evaluation.benchmarks.projecttest import ProjectTestDataset
+
+        data_dir = self._build_fake_project(
+            tmp_path,
+            "fuzzy",
+            {
+                "utils.py": (
+                    "def check_for_none(fn):\n"
+                    "    def wrapped(*a, **kw):\n"
+                    "        if any(x is None for x in a): return 0\n"
+                    "        return fn(*a, **kw)\n"
+                    "    return wrapped\n"
+                ),
+                "fuzz.py": (
+                    "from fuzzy import utils\n"
+                    "@utils.check_for_none\n"
+                    "def ratio(a, b):\n"
+                    "    return 100\n"
+                ),
+            },
+        )
+        ds = ProjectTestDataset(data_dir=data_dir, language_filter="python")
+        ds.download = lambda: data_dir
+        cases = ds.load()
+        combined = cases[0].code
+        assert "SimpleNamespace" in combined
+        assert "utils.check_for_none = check_for_none" in combined
+        # The whole thing must execute cleanly
+        ns: dict = {}
+        exec(compile(combined, "<combined>", "exec"), ns)
+        assert ns["ratio"]("a", "b") == 100
+        assert ns["ratio"](None, "b") == 0
+
+
 # ── Benchmark registry test ──────────────────────────────────────────
 
 

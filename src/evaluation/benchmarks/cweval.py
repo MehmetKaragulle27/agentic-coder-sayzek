@@ -41,6 +41,19 @@ class CWEvalDataset:
             return "javascript"
         return "python"
 
+    # Map language subdirectory -> (language name, task-file glob).
+    # CWEval's canonical layout is:
+    #   benchmark/core/py/cwe_NNN_M_task.py   -> source to analyze
+    #   benchmark/core/py/cwe_NNN_M_test.py   -> reference test harness (SKIP)
+    #   benchmark/core/c/ ...                  -> C sources + Python harness
+    #                                             that execs compiled binaries
+    #                                             (SKIP — our sandbox can't run them)
+    # We only load `*_task.{py,js}` from the py/ and js/ subtrees.
+    _LANG_DIRS = {
+        "py": "python",
+        "js": "javascript",
+    }
+
     def load(self) -> List[BenchmarkCase]:
         self.download()
         cases: List[BenchmarkCase] = []
@@ -76,20 +89,32 @@ class CWEvalDataset:
                     user_request="Generate comprehensive unit tests",
                 ))
 
-        # Fallback: scan for source files alongside a manifest
+        # Fallback: walk the canonical repo layout and only keep *_task.* files
+        # from Python / JavaScript subtrees. This deliberately excludes every
+        # *_test.{py,js}, compiled-language harness (c/, cpp/, go/), and any
+        # other auxiliary file so the pipeline always sees real source code.
         if not cases:
-            for src_dir in ("benchmark", "data", "tasks"):
-                base = self._root / src_dir
-                if not base.exists():
-                    continue
-                for py in sorted(base.rglob("*.py")):
-                    code = py.read_text(encoding="utf-8", errors="replace")
-                    cases.append(BenchmarkCase(
-                        id=f"cweval-{py.stem}",
-                        code=code,
-                        language="python",
-                        user_request="Generate comprehensive unit tests",
-                    ))
+            core = self._root / "benchmark" / "core"
+            if core.exists():
+                for sub, lang in self._LANG_DIRS.items():
+                    if self._lang_filter and lang != self._lang_filter:
+                        continue
+                    ext = ".py" if sub == "py" else ".js"
+                    base = core / sub
+                    if not base.exists():
+                        continue
+                    for src in sorted(base.rglob(f"*_task{ext}")):
+                        code = src.read_text(encoding="utf-8", errors="replace")
+                        stem = src.stem  # e.g. "cwe_022_0_task"
+                        cwe_id = stem.split("_")[1] if stem.startswith("cwe_") else ""
+                        cases.append(BenchmarkCase(
+                            id=f"cweval-{stem}",
+                            code=code,
+                            language=lang,
+                            expected_cwe=f"CWE-{cwe_id}" if cwe_id else "",
+                            metadata={"file": str(src.relative_to(self._root))},
+                            user_request="Generate comprehensive unit tests",
+                        ))
 
         log.info("Loaded %d cases from CWEval benchmark", len(cases))
         return cases

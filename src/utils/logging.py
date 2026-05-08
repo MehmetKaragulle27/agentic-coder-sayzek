@@ -40,31 +40,35 @@ class AuditLogger:
         audit_entries: List[dict],
         source_identifier: str,
         metadata: Optional[dict] = None,
+        provenance: Optional[dict] = None,
     ) -> Path:
         """Save audit log to file.
-        
+
         Args:
             audit_entries: List of audit entries from pipeline
             source_identifier: Identifier for the source
             metadata: Optional additional metadata
-            
+            provenance: Optional LLM/model provenance for paper reproducibility
+                (expected shape: {"coding": {...}, "judge": {...}})
+
         Returns:
             Path to saved log file
         """
         filename = self._generate_filename(source_identifier)
         filepath = self.log_dir / filename
-        
+
         log_data = {
             "source": source_identifier,
             "created_at": datetime.now().isoformat(),
             "total_iterations": len(audit_entries),
             "metadata": metadata or {},
+            "provenance": provenance or {},
             "entries": audit_entries,
         }
-        
+
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(log_data, f, indent=2, default=str)
-        
+
         return filepath
     
     def load(self, filepath: Path) -> dict:

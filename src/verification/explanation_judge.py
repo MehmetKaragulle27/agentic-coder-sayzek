@@ -47,14 +47,19 @@ class ExplanationJudge:
         self.llm = llm
 
     def _parse_rubric(self, response_text: str) -> List[dict]:
-        """Parse the judge response into rubric results."""
-        json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
-        if not json_match:
+        """Parse the judge response into rubric results.
+
+        Handles JSON drift (markdown fences, extra text, single-object responses).
+        """
+        from .judge import _extract_json  # reuse the tolerant extractor
+        parsed = _extract_json(response_text)
+        if parsed is None:
             return []
-        try:
-            return json.loads(json_match.group())
-        except json.JSONDecodeError:
-            return []
+        if isinstance(parsed, dict):
+            return [parsed]
+        if isinstance(parsed, list):
+            return parsed
+        return []
 
     def verify(self, code: str, explanation_json: str) -> GateResult:
         """Verify an explanation against the rubric.

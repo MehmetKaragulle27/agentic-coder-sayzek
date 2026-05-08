@@ -9,8 +9,18 @@ from typing import Optional, List
 from .models import GateResult, Finding, Severity
 
 
+# CWE/Bandit codes that are noise on generated *test* code and should never
+# block the gate (e.g. Bandit B101 flags every `assert` statement, which is
+# the whole point of a test file; CWE-703 is its CWE mapping).
+_IGNORED_CODES = {"CWE-703", "B101"}
+
+
 class SastAnalyzer:
     """Run SAST tools (Semgrep + Bandit) on generated code."""
+
+    # Severities considered blocking (gate fails if any such finding survives
+    # the LLM judge's false-positive filter).
+    BLOCKING_SEVERITIES = {Severity.ERROR, Severity.WARNING}
 
     def __init__(
         self,
@@ -182,15 +192,21 @@ class SastAnalyzer:
 
             all_findings = semgrep_findings + bandit_findings
 
-            has_errors = any(
-                f.severity == Severity.ERROR
+            # Drop noise findings that are spurious on generated test code.
+            all_findings = [
+                f for f in all_findings
+                if (f.code or "").upper() not in _IGNORED_CODES
+            ]
+
+            has_blocking = any(
+                f.severity in self.BLOCKING_SEVERITIES
                 for f in all_findings
                 if "not installed" not in f.message
             )
 
             return GateResult(
                 gate_name="sast",
-                passed=not has_errors,
+                passed=not has_blocking,
                 findings=all_findings,
             )
         finally:

@@ -65,20 +65,49 @@ class AblationRunner:
         self._variant_metrics: Dict[str, EvalMetrics] = {}
 
     def _apply_variant(self, config, variant: AblationConfig):
-        """Return a deep-copied config with the variant applied."""
+        """Return a deep-copied config with the variant applied.
+
+        The coding and judge role configs (provider/model/fallbacks) are
+        intentionally preserved across variants so that ablation results
+        reflect the effect of the gate being toggled, not a model swap.
+        """
         cfg = copy.deepcopy(config)
         cfg.sast.enabled = variant.sast_enabled
         cfg.dependency.enabled = variant.dependency_enabled
         cfg.judge.enabled = variant.judge_enabled
         cfg.pipeline.max_retries = variant.retry_budget
+        # coding_role / judge_role are left unchanged -> judge is pinned.
         return cfg
 
     def run_all(
         self,
         max_cases_per_variant: Optional[int] = None,
         axes: Optional[List[str]] = None,
+        only_variants: Optional[List[str]] = None,
     ) -> Dict[str, EvalMetrics]:
+        """Run the ablation sweep.
+
+        Parameters
+        ----------
+        only_variants:
+            If provided, only variants whose ``name`` matches one of the
+            entries in this list are executed. Useful for re-running a
+            small set of contaminated variants without redoing the whole
+            32-variant sweep. Names use the canonical
+            ``sast=<on|off>_dep=<on|off>_judge=<on|off>_k=<int>`` form.
+        """
         variants = generate_variants(axes)
+        if only_variants:
+            wanted = set(only_variants)
+            variants = [v for v in variants if v.name in wanted]
+            missing = wanted - {v.name for v in variants}
+            if missing:
+                log.warning("Requested variants not found in axes set: %s", sorted(missing))
+            if not variants:
+                raise ValueError(
+                    f"No matching variants for filter {sorted(wanted)}. "
+                    f"Hint: variant names look like 'sast=off_dep=off_judge=off_k=0'."
+                )
         log.info("Running %d ablation variants on %s", len(variants), self.dataset.name)
 
         for i, variant in enumerate(variants):
@@ -113,14 +142,42 @@ class AblationRunner:
                 "avg_time": round(m.avg_time, 2),
             })
 
+        coding_prov = (
+            self.base_config.coding_role.provenance()
+            if getattr(self.base_config, "coding_role", None) else None
+        )
+        judge_prov = (
+            (self.base_config.judge_role or self.base_config.coding_role).provenance()
+            if getattr(self.base_config, "coding_role", None) else None
+        )
+        comparison_payload = {
+            "dataset": self.dataset.name,
+            "provenance": {
+                "coding": coding_prov,
+                "judge": judge_prov,
+                "note": "Coding and judge models are pinned across all variants "
+                        "to isolate the effect of the ablated component.",
+            },
+            "variants": rows,
+        }
+
         json_path = self.results_dir / "comparison.json"
-        json_path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+        json_path.write_text(json.dumps(comparison_payload, indent=2), encoding="utf-8")
 
         md_lines = [
             f"# Ablation comparison: {self.dataset.name}\n",
+        ]
+        if coding_prov and judge_prov:
+            md_lines.append(
+                f"**Coding:** `{coding_prov['primary']['provider']}:"
+                f"{coding_prov['primary']['model']}` &nbsp; "
+                f"**Judge:** `{judge_prov['primary']['provider']}:"
+                f"{judge_prov['primary']['model']}` (pinned across variants)\n"
+            )
+        md_lines.extend([
             "| Variant | Total | Passed | Pass rate | Avg cov | Avg iter | Avg time |",
             "|---------|-------|--------|-----------|---------|----------|----------|",
-        ]
+        ])
         for r in rows:
             cov = f"{r['avg_coverage']}%" if r["avg_coverage"] else "N/A"
             md_lines.append(

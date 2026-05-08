@@ -104,42 +104,68 @@ class RouterAgent:
         
         return Language.UNKNOWN
     
+    # Keywords that strongly indicate a unit-testing task. When *any* of
+    # these appear in the request, we route to UNIT_TEST regardless of
+    # whether explanation keywords are also present -- benchmark
+    # problem descriptions frequently contain words like ``comment``,
+    # ``complexity`` or ``describe`` that used to hijack routing even
+    # when the user explicitly asked for ``unit tests``.
+    UNIT_TEST_KEYWORDS = (
+        'unit test', 'unit-test', 'generate test', 'generate a test',
+        'generate tests', 'write test', 'write a test', 'write tests',
+        'pytest', 'jest', 'mocha', 'coverage',
+        'test case', 'test function', 'test suite',
+    )
+
+    # UI tests are always highest priority because they're the most
+    # specific/unambiguous.
+    UI_TEST_KEYWORDS = (
+        'ui test', 'e2e test', 'end-to-end', 'end to end',
+        'playwright', 'selenium', 'browser automation',
+        'web test', 'acceptance test',
+    )
+
+    # Explanation keywords; only used when the request is *not*
+    # clearly a test generation job. Kept narrow on purpose -- words
+    # like ``comment`` or ``complexity`` are too common in benchmark
+    # descriptions to treat as signal on their own.
+    EXPLAIN_KEYWORDS = (
+        'explain', 'what does', 'how does', 'walkthrough',
+        'describe in plain english', 'summarise', 'summarize',
+        'big-o analysis', 'time complexity analysis',
+    )
+
     def classify_task(self, user_request: str) -> TaskType:
         """Classify the task type based on user request.
-        
-        Args:
-            user_request: User's request string
-            
-        Returns:
-            Classified task type
+
+        Order of precedence:
+
+        1. UI test keywords (most specific) -> UI_TEST
+        2. Explicit unit-test keywords -> UNIT_TEST
+        3. Explanation keywords -> EXPLANATION
+        4. Default -> UNIT_TEST
+
+        We deliberately check unit-test keywords *before* explanation
+        keywords because benchmark problem descriptions often mention
+        "comment", "complexity", or "describe" while the actual user
+        request at the top of the string clearly says "Generate
+        comprehensive unit tests". The old ordering misrouted such
+        cases as explanations and skipped the sandbox gate entirely.
         """
         request_lower = user_request.lower()
-        
-        ui_keywords = [
-            'ui test', 'e2e test', 'end-to-end', 'end to end',
-            'playwright', 'selenium', 'browser', 'click', 'navigate',
-            'web test', 'integration test', 'acceptance test',
-        ]
-        
-        explain_keywords = [
-            'explain', 'what does', 'how does', 'understand',
-            'complexity', 'big-o', 'analysis', 'describe',
-            'documentation', 'comment', 'walkthrough',
-        ]
-        
-        unit_keywords = [
-            'unit test', 'test', 'pytest', 'jest', 'coverage',
-            'assert', 'mock', 'test case', 'test function',
-        ]
-        
-        for keyword in ui_keywords:
+
+        for keyword in self.UI_TEST_KEYWORDS:
             if keyword in request_lower:
                 return TaskType.UI_TEST
-        
-        for keyword in explain_keywords:
+
+        for keyword in self.UNIT_TEST_KEYWORDS:
+            if keyword in request_lower:
+                return TaskType.UNIT_TEST
+
+        for keyword in self.EXPLAIN_KEYWORDS:
             if keyword in request_lower:
                 return TaskType.EXPLANATION
-        
+
         return TaskType.UNIT_TEST
     
     def get_framework_hint(self, language: Language, task_type: TaskType) -> str:

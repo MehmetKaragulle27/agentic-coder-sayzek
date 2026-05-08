@@ -67,6 +67,32 @@ const greet = (user: User): string => {
     def test_classify_explanation_task(self):
         result = self.router.classify_task("Explain what this code does")
         assert result == TaskType.EXPLANATION
+
+    def test_classify_unit_test_wins_over_description_words(self):
+        """Regression: benchmark descriptions often contain words like
+        ``comment``, ``complexity`` or ``describe`` which the router
+        previously treated as strong explanation signal and mis-routed
+        away from sandbox execution. The explicit ``Generate ... unit
+        tests`` prefix must take precedence."""
+        result = self.router.classify_task(
+            "Generate comprehensive unit tests for the function below.\n\n"
+            "Problem description:\nCollect data on number of comments in "
+            "the current file and describe complexity."
+        )
+        assert result == TaskType.UNIT_TEST
+
+    def test_classify_pure_explanation_still_routes_to_explanation(self):
+        result = self.router.classify_task(
+            "Explain how does this function work and walkthrough the logic."
+        )
+        assert result == TaskType.EXPLANATION
+
+    def test_classify_ui_test_wins_over_unit_test_and_explain(self):
+        result = self.router.classify_task(
+            "Write unit tests? Actually we want an e2e test with playwright "
+            "that describes user flow."
+        )
+        assert result == TaskType.UI_TEST
     
     def test_route_python_unit_test(self):
         code = '''

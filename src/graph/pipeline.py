@@ -26,9 +26,10 @@ from ..verification.dependency import DependencyValidator
 from ..verification.judge import SastJudge
 from ..verification.explanation_judge import ExplanationJudge
 from ..verification.complexity import ComplexityValidator
+from ..verification.relevance import RelevanceValidator
 from ..verification.models import GateResult, VerificationReport, Finding, Severity
 from ..utils.logging import AuditLogger
-from ..config import Config, get_llm
+from ..config import Config, get_llm, get_role_llm
 
 JS_LANGUAGES = {Language.JAVASCRIPT.value, Language.TYPESCRIPT.value}
 
@@ -70,6 +71,14 @@ class PipelineState(TypedDict):
     verification_report: Optional[dict]
     coverage_report: Optional[str]
 
+    # Actual pytest pass/fail counts from the sandbox gate. Kept at the
+    # top-level of the state so the evaluation runner can report real
+    # partial-success numbers (e.g. "18/28 tests passed") instead of
+    # collapsing multi-file projects to all-or-nothing. LangGraph will
+    # drop keys not declared in the TypedDict, so they must live here.
+    sandbox_tests_run: Optional[int]
+    sandbox_tests_passed: Optional[int]
+
     # Legacy single-gate fields kept for CLI compatibility
     verification_result: Optional[dict]
     verification_passed: bool
@@ -92,7 +101,10 @@ def create_pipeline(config: Optional[Config] = None):
     if config is None:
         config = Config.load()
 
-    llm = get_llm(config.llm)
+    # Coding and judge may be different providers/models with independent
+    # fallback chains. Both default to the same primary if the role-based
+    # env vars aren't configured (legacy behavior).
+    llm = get_role_llm(config, "coding")
     router_agent = RouterAgent()
     unit_test_agent = UnitTestAgent(llm)
     jest_test_agent = JestTestAgent(llm)
@@ -113,18 +125,22 @@ def create_pipeline(config: Optional[Config] = None):
         pypi_timeout=config.dependency.pypi_timeout,
     ) if config.dependency.enabled else None
 
-    judge_llm = llm
-    if config.judge.enabled and config.judge.provider:
-        from ..config import LLMConfig
-        judge_cfg = LLMConfig.from_env(config.judge.provider)
-        if config.judge.model:
-            judge_cfg.model = config.judge.model
-        judge_llm = get_llm(judge_cfg)
+    judge_llm = get_role_llm(config, "judge")
 
     sast_judge = SastJudge(judge_llm) if config.judge.enabled else None
 
     explanation_judge = ExplanationJudge(judge_llm) if config.explanation.judge_enabled else None
     complexity_validator = ComplexityValidator() if config.explanation.complexity_check_enabled else None
+
+    # Anti-gaming relevance gate (opt-in via RELEVANCE_GATE_ENABLED).
+    # Catches the failure mode where the LLM ignores the target function
+    # and writes tests for fictional code -- discovered in the ULT
+    # ablation, where ~33% of "passing" cases at k=5 had zero tests
+    # referencing the target.
+    relevance_validator = RelevanceValidator(
+        source_module=config.relevance.source_module,
+        min_relevance_signals=config.relevance.min_signals,
+    ) if config.relevance.enabled else None
 
     # ── Nodes ──────────────────────────────────────────────────────────
 
@@ -250,19 +266,38 @@ def create_pipeline(config: Optional[Config] = None):
             return GateResult(gate_name="sast", passed=True, findings=[])
 
         def run_deps():
-            if dep_validator:
-                return dep_validator.validate(test_code, language=lang)
-            return GateResult(gate_name="dependency", passed=True, findings=[])
+            if not dep_validator:
+                return GateResult(gate_name="dependency", passed=True, findings=[])
+            # Validate BOTH the source code and the generated test code.
+            # Previously only the test code was checked, which meant
+            # phantom imports in the subject-under-test (the exact
+            # thing the ``dep_hallucination`` benchmark exists to
+            # surface) slipped through undetected.
+            combined = (state["code_input"] or "") + "\n\n" + (test_code or "")
+            return dep_validator.validate(combined, language=lang)
 
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        def run_relevance():
+            if not relevance_validator or is_ui:
+                return None
+            # Tests for explanation tasks aren't subject to relevance.
+            return relevance_validator.validate(
+                test_code,
+                source_code=state["code_input"],
+            )
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
             sast_future = pool.submit(run_sast)
             dep_future = pool.submit(run_deps)
+            rel_future = pool.submit(run_relevance)
             sast_result = sast_future.result()
             dep_result = dep_future.result()
+            rel_result = rel_future.result()
 
         gate_results = [sast_result.model_dump(), dep_result.model_dump()]
-
         static_passed = sast_result.passed and dep_result.passed
+        if rel_result is not None:
+            gate_results.append(rel_result.model_dump())
+            static_passed = static_passed and rel_result.passed
 
         return {
             **state,
@@ -385,6 +420,12 @@ def create_pipeline(config: Optional[Config] = None):
             **state,
             "gate_results": all_gates,
             "coverage_report": result.coverage_gaps,
+            # Propagate the actual pytest pass/fail counts so downstream
+            # consumers (eval runner, paper metrics) can report partial
+            # success rather than collapsing everything to a single
+            # all-or-nothing pass flag.
+            "sandbox_tests_run": getattr(result, "tests_run", 0),
+            "sandbox_tests_passed": getattr(result, "tests_passed", 0),
             "status": "sandbox_checked",
         }
 
@@ -560,7 +601,17 @@ def create_pipeline(config: Optional[Config] = None):
         else:
             final_output = state.get("generated_tests") if state["verification_passed"] else state.get("generated_tests")
 
-        audit_logger.save(state["audit_log"], state.get("file_path") or "unknown")
+        provenance = {
+            "coding": config.coding_role.provenance() if config.coding_role else None,
+            "judge": (config.judge_role or config.coding_role).provenance()
+                     if (config.judge_role or config.coding_role) else None,
+            "timestamp": datetime.now().isoformat(),
+        }
+        audit_logger.save(
+            state["audit_log"],
+            state.get("file_path") or "unknown",
+            provenance=provenance,
+        )
 
         return {
             **state,
@@ -637,12 +688,29 @@ def _sandbox_to_findings(result) -> List[Finding]:
     """Convert sandbox ExecutionResult errors into Finding objects."""
     findings: List[Finding] = []
 
+    _SUGGESTIONS: dict = {
+        "no_tests_collected": (
+            "Ensure the test file defines at least one test_* function or "
+            "Test* class with test_* methods. Check for syntax errors or "
+            "import errors before the test definitions."
+        ),
+        "syntax_error": (
+            "Fix the syntax error in the test file. The error is usually "
+            "on or near the reported line."
+        ),
+        "import_error": (
+            "Fix the import statement — the module or name may not exist. "
+            "Check that imports from source_module use correct names."
+        ),
+    }
+
     if result.error_type:
         findings.append(Finding(
             severity=Severity.ERROR,
             code=result.error_type,
             message=result.error_message or "Sandbox execution failed",
             line=result.line_number,
+            suggestion=_SUGGESTIONS.get(result.error_type),
         ))
 
     if result.tests_failed > 0 and not result.error_type:
@@ -650,6 +718,14 @@ def _sandbox_to_findings(result) -> List[Finding]:
             severity=Severity.ERROR,
             code="test_failure",
             message=f"{result.tests_failed} test(s) failed",
+        ))
+
+    if result.tests_run == 0 and not result.error_type:
+        findings.append(Finding(
+            severity=Severity.ERROR,
+            code="no_tests_collected",
+            message="No test functions were collected by pytest",
+            suggestion="Ensure the test file defines at least one test_* function or Test* class",
         ))
 
     return findings

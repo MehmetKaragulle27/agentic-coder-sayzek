@@ -35,8 +35,51 @@ JUDGE_PROMPT_TEMPLATE = """Below is code that was flagged by static analysis too
 Respond with ONLY a JSON array of verdict objects."""
 
 
+def _extract_json(text: str):
+    """Best-effort JSON extractor that tolerates common model quirks.
+
+    - strips <think>...</think> blocks (Qwen / R1 reasoning models)
+    - strips ```json ... ``` fences
+    - takes the outermost [...] if present, else the outermost {...}
+    - returns None on unrecoverable parse failure
+    """
+    if not text:
+        return None
+
+    # Reasoning models emit their chain-of-thought before the answer.
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+
+    fence_match = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    if fence_match:
+        inner = fence_match.group(1).strip()
+        try:
+            return json.loads(inner)
+        except json.JSONDecodeError:
+            pass
+
+    arr_match = re.search(r"\[.*\]", text, re.DOTALL)
+    if arr_match:
+        try:
+            return json.loads(arr_match.group())
+        except json.JSONDecodeError:
+            pass
+
+    obj_match = re.search(r"\{.*\}", text, re.DOTALL)
+    if obj_match:
+        try:
+            return json.loads(obj_match.group())
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
+
 class SastJudge:
     """LLM-based judge for SAST false-positive filtering."""
+
+    # Severities the judge triages and which block the gate if confirmed
+    # as true positives. Keep in sync with SastAnalyzer.BLOCKING_SEVERITIES.
+    TRIAGE_SEVERITIES = (Severity.ERROR, Severity.WARNING)
 
     def __init__(self, llm: BaseChatModel):
         self.llm = llm
@@ -56,17 +99,14 @@ class SastJudge:
     def _parse_verdicts(self, response_text: str, count: int) -> List[JudgeVerdict]:
         """Parse the LLM response into verdict values.
 
+        Handles JSON drift across providers: markdown code fences, extra text
+        before/after the JSON, and single-object responses (some models return
+        a single {} when there is only one finding).
         Falls back to UNCERTAIN for any entries that fail to parse.
         """
         verdicts = [JudgeVerdict.UNCERTAIN] * count
-
-        json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
-        if not json_match:
-            return verdicts
-
-        try:
-            items = json.loads(json_match.group())
-        except json.JSONDecodeError:
+        items = _extract_json(response_text)
+        if items is None:
             return verdicts
 
         verdict_map = {
@@ -75,11 +115,16 @@ class SastJudge:
             "uncertain": JudgeVerdict.UNCERTAIN,
         }
 
-        for item in items:
+        if isinstance(items, dict):
+            items = [items]
+        if not isinstance(items, list):
+            return verdicts
+
+        for i, item in enumerate(items):
             if not isinstance(item, dict):
                 continue
-            idx = item.get("index")
-            raw_verdict = item.get("verdict", "").lower().strip()
+            idx = item.get("index", i)
+            raw_verdict = str(item.get("verdict", "")).lower().strip()
             if isinstance(idx, int) and 0 <= idx < count:
                 verdicts[idx] = verdict_map.get(raw_verdict, JudgeVerdict.UNCERTAIN)
 
@@ -97,7 +142,7 @@ class SastJudge:
         """
         actionable = [
             f for f in gate_result.findings
-            if f.severity in (Severity.ERROR, Severity.WARNING)
+            if f.severity in self.TRIAGE_SEVERITIES
             and "not installed" not in f.message
         ]
 
@@ -131,8 +176,11 @@ class SastJudge:
             else:
                 updated_findings.append(f)
 
-        has_real_errors = any(
-            f.severity == Severity.ERROR
+        # Gate fails if any blocking-severity finding survives the
+        # false-positive filter (was previously error-only — which let
+        # WARNING-severity CWEs like SQL injection pass through).
+        has_real_blocking = any(
+            f.severity in self.TRIAGE_SEVERITIES
             and f.judge_verdict != JudgeVerdict.FALSE_POSITIVE
             for f in updated_findings
             if "not installed" not in f.message
@@ -140,7 +188,7 @@ class SastJudge:
 
         return GateResult(
             gate_name=gate_result.gate_name,
-            passed=not has_real_errors,
+            passed=not has_real_blocking,
             findings=updated_findings,
             details=gate_result.details,
         )

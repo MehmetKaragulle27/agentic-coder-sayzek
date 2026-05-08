@@ -136,7 +136,30 @@ def generate(
         console.print("  2. Add your Groq API key (get one free at https://console.groq.com/)")
         sys.exit(1)
 
-    logger.step("Configuration loaded", f"Provider: {config.llm.provider}, Model: {config.llm.model}")
+    if config.coding_role and config.judge_role and (
+        config.coding_role.primary.provider != config.judge_role.primary.provider
+        or config.coding_role.primary.model != config.judge_role.primary.model
+    ):
+        cr = config.coding_role.primary
+        jr = config.judge_role.primary
+        fb_count = len(config.coding_role.fallbacks) + len(config.judge_role.fallbacks)
+        logger.step(
+            "Configuration loaded",
+            f"Coding: {cr.provider}:{cr.model} | Judge: {jr.provider}:{jr.model} "
+            f"| {fb_count} fallback endpoint(s)",
+        )
+    elif config.coding_role and config.coding_role.fallbacks:
+        cr = config.coding_role.primary
+        logger.step(
+            "Configuration loaded",
+            f"Provider: {cr.provider}, Model: {cr.model} "
+            f"(+{len(config.coding_role.fallbacks)} fallback endpoint(s))",
+        )
+    else:
+        logger.step(
+            "Configuration loaded",
+            f"Provider: {config.llm.provider}, Model: {config.llm.model}",
+        )
 
     if is_explanation:
         user_request = "Explain this code with complexity analysis"
@@ -362,7 +385,7 @@ BENCHMARK_CHOICES = [
 @click.option("--benchmark", "-b", type=click.Choice(BENCHMARK_CHOICES), required=True, help="Benchmark to evaluate")
 @click.option("--max-cases", "-n", type=int, default=None, help="Max cases to run")
 @click.option("--output-dir", "-o", type=str, default=None, help="Results directory")
-@click.option("--provider", type=click.Choice(["groq", "openrouter"]), default=None)
+@click.option("--provider", default=None, help="Override coding provider (e.g. gemini, cerebras, groq). Leave unset to use CODING_PROVIDER from .env.")
 @click.option("--verbose", "-v", is_flag=True)
 def evaluate(benchmark, max_cases, output_dir, provider, verbose):
     """Run the pipeline against a benchmark dataset."""
@@ -396,9 +419,20 @@ def evaluate(benchmark, max_cases, output_dir, provider, verbose):
 @click.option("--max-cases", "-n", type=int, default=None)
 @click.option("--axes", "-a", type=str, default="sast,dependency,judge,retries", help="Comma-separated ablation axes")
 @click.option("--output-dir", "-o", type=str, default=None)
-@click.option("--provider", type=click.Choice(["groq", "openrouter"]), default=None)
+@click.option("--provider", default=None, help="Override coding provider (e.g. gemini, cerebras, groq). Leave unset to use CODING_PROVIDER from .env.")
+@click.option(
+    "--variants",
+    type=str,
+    default=None,
+    help=(
+        "Comma-separated list of specific variant names to run, e.g. "
+        "'sast=off_dep=off_judge=off_k=0,sast=off_dep=off_judge=off_k=1'. "
+        "Useful for re-running a small subset of contaminated variants "
+        "without redoing the whole sweep."
+    ),
+)
 @click.option("--verbose", "-v", is_flag=True)
-def ablation(benchmark, max_cases, axes, output_dir, provider, verbose):
+def ablation(benchmark, max_cases, axes, output_dir, provider, variants, verbose):
     """Run ablation studies across config variants."""
     from .config import Config
     from .evaluation.benchmarks import get_dataset
@@ -409,6 +443,9 @@ def ablation(benchmark, max_cases, axes, output_dir, provider, verbose):
     results_dir = output_dir or config.evaluation.results_dir
 
     axes_list = [a.strip() for a in axes.split(",")]
+    only_variants = (
+        [v.strip() for v in variants.split(",") if v.strip()] if variants else None
+    )
 
     if benchmark == "all":
         names = [n for n in BENCHMARK_CHOICES if n != "all"]
@@ -417,9 +454,17 @@ def ablation(benchmark, max_cases, axes, output_dir, provider, verbose):
 
     for name in names:
         console.print(f"\n[bold]Ablation on: {name}[/bold]")
+        if only_variants:
+            console.print(f"[dim]Filtering to {len(only_variants)} variant(s):[/dim]")
+            for v in only_variants:
+                console.print(f"  - {v}")
         ds = get_dataset(name, data_dir=Path(config.evaluation.data_dir))
         runner = AblationRunner(base_config=config, dataset=ds, results_dir=results_dir)
-        variant_metrics = runner.run_all(max_cases_per_variant=max_cases, axes=axes_list)
+        variant_metrics = runner.run_all(
+            max_cases_per_variant=max_cases,
+            axes=axes_list,
+            only_variants=only_variants,
+        )
         console.print(f"[green]Completed {len(variant_metrics)} variants.[/green]")
 
 

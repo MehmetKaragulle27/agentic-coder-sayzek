@@ -50,6 +50,22 @@ class GateResult(BaseModel):
             and f.judge_verdict != JudgeVerdict.FALSE_POSITIVE
         ]
 
+    @property
+    def blocking_findings(self) -> List[Finding]:
+        """Return findings that should block the gate (ERROR + WARNING),
+        excluding those the judge classified as false positives.
+
+        Many SAST tools map real security issues like SQL injection, weak
+        crypto and path traversal to WARNING severity (e.g. Bandit MEDIUM),
+        so the repair loop needs to see those too — not just ERRORs.
+        """
+        blocking = {Severity.ERROR, Severity.WARNING}
+        return [
+            f for f in self.findings
+            if f.severity in blocking
+            and f.judge_verdict != JudgeVerdict.FALSE_POSITIVE
+        ]
+
 
 class VerificationReport(BaseModel):
     """Unified report aggregating all gate results."""
@@ -100,7 +116,10 @@ class VerificationReport(BaseModel):
                 continue
 
             sections.append(f"[GATE: {gate.gate_name}] FAIL")
-            for f in gate.error_findings:
+            # Use blocking_findings so WARNING-level security issues
+            # (SQL injection, weak hash, etc.) are surfaced to the repair LLM.
+            relevant = gate.blocking_findings or gate.error_findings
+            for f in relevant:
                 line_info = f" at line {f.line}" if f.line else ""
                 code_info = f" ({f.code})" if f.code else ""
                 sections.append(f"  - {f.severity.value.upper()}{code_info}{line_info}: {f.message}")

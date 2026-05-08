@@ -133,7 +133,38 @@ class SandboxExecutor:
         match = re.search(line_pattern, combined)
         if match:
             result["line_number"] = int(match.group(1))
-        
+
+        # "collected 0 items" — pytest couldn't find any test functions.
+        # This is a distinct failure mode from tests_failed > 0 and needs
+        # to be surfaced to the repair LLM so it knows the test file is
+        # structurally wrong (missing test_* functions, import errors
+        # before collection, etc.).
+        if result["tests_run"] == 0 and not result["error_type"]:
+            result["error_type"] = "no_tests_collected"
+            collected_msg = ""
+            # Walk stdout backwards to find actionable info. Skip coverage
+            # table rows, summary bars, and the "no tests ran" footer.
+            _COV_SKIP = {"Name", "TOTAL", "source_module.py"}
+            for line in reversed(stdout.splitlines()):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if stripped.startswith("="):
+                    continue
+                if stripped.startswith("-"):
+                    continue
+                if "no tests ran" in stripped.lower():
+                    continue
+                if stripped.split()[0] in _COV_SKIP:
+                    continue
+                # First meaningful line (could be an import error, syntax
+                # error, or the "collected 0 items" line itself).
+                collected_msg = stripped
+                break
+            result["error_message"] = (
+                collected_msg or "No test functions were collected by pytest"
+            )
+
         if not result["error_type"] and result["tests_failed"] > 0:
             result["error_type"] = "test_failure"
             fail_match = re.search(r'FAILED (.+)', stdout)
@@ -205,12 +236,27 @@ class SandboxExecutor:
                               f"Please build it with: docker build -t {self.config.image_name} -f docker/Dockerfile .",
             )
         
+        # Use detach=True so we can retrieve stdout and stderr separately
+        # after the container exits. The default run(detach=False) path loses
+        # stdout when the container exits non-zero (it raises ContainerError
+        # with only stderr populated), which swallows pytest's failure output.
+        container = None
         try:
+            # Enforce the wall-clock budget *inside* the container with
+            # pytest-timeout so the container self-terminates. docker-py's
+            # ``container.wait(timeout=...)`` is an HTTP request timeout, not
+            # a container runtime limit, so we give it generous headroom on
+            # top of the pytest budget.
+            test_timeout = max(10, int(self.config.timeout))
+            http_wait_timeout = test_timeout + 60
+
             container = client.containers.run(
                 self.config.image_name,
                 command=[
                     "pytest", "-v", "--tb=short",
                     "-p", "no:cacheprovider",
+                    f"--timeout={test_timeout}",
+                    "--timeout-method=thread",
                     "--cov=source_module", "--cov-report=term-missing",
                     "test_generated.py",
                 ],
@@ -225,20 +271,33 @@ class SandboxExecutor:
                 mem_limit=self.config.memory_limit,
                 cpu_period=100000,
                 cpu_quota=int(self.config.cpu_limit * 100000),
-                remove=True,
-                detach=False,
+                detach=True,
                 stdout=True,
                 stderr=True,
             )
-            
-            stdout = container.decode("utf-8") if isinstance(container, bytes) else str(container)
-            stderr = ""
-            exit_code = 0
-            
-        except docker.errors.ContainerError as e:
-            stdout = e.stderr.decode("utf-8") if e.stderr else ""
-            stderr = str(e)
-            exit_code = e.exit_status
+
+            try:
+                wait_result = container.wait(timeout=http_wait_timeout)
+                exit_code = int(wait_result.get("StatusCode", 1))
+            except Exception as wait_exc:
+                # HTTP timeout or daemon hiccup: kill the container and
+                # surface a useful error rather than leaking it.
+                try:
+                    container.kill()
+                except Exception:
+                    pass
+                return ExecutionResult(
+                    success=False,
+                    exit_code=-1,
+                    error_type="docker_timeout",
+                    error_message=f"container.wait timed out after {http_wait_timeout}s: {wait_exc}",
+                )
+
+            stdout_bytes = container.logs(stdout=True, stderr=False) or b""
+            stderr_bytes = container.logs(stdout=False, stderr=True) or b""
+            stdout = stdout_bytes.decode("utf-8", errors="replace")
+            stderr = stderr_bytes.decode("utf-8", errors="replace")
+
         except Exception as e:
             return ExecutionResult(
                 success=False,
@@ -246,6 +305,12 @@ class SandboxExecutor:
                 error_type="docker_error",
                 error_message=str(e),
             )
+        finally:
+            if container is not None:
+                try:
+                    container.remove(force=True)
+                except Exception:
+                    pass
         
         parsed = self._parse_pytest_output(stdout, stderr)
         coverage = self._parse_coverage(stdout)
@@ -353,47 +418,92 @@ class SandboxExecutor:
         Strategy: only rewrite imports whose root module is NOT a known
         stdlib/third-party package. Everything else (unittest.mock, tempfile,
         os, json, numpy, ...) is preserved untouched.
+
+        Implemented with AST surgery (not line regex) so multi-line
+        parenthesized imports like::
+
+            from foo import (
+                bar,
+                baz,
+            )
+
+        get rewritten as a single logical unit instead of leaving dangling
+        continuation lines that later raise IndentationError.
         """
-        lines = test_code.split("\n")
-        fixed_lines = []
+        import ast
+
+        try:
+            tree = ast.parse(test_code)
+        except SyntaxError:
+            # If the LLM produced unparseable code, fall back to a safe stub
+            # with just the wildcard import — the sandbox will surface the
+            # original syntax error via pytest anyway.
+            return "from source_module import *\n\n" + test_code
+
         has_source_import = False
+        replacements: list = []  # (start_line, end_line, new_text)
 
-        from_re = re.compile(r"^(\s*)from\s+([\w\.]+)\s+import\s+(.+?)\s*$")
-        import_re = re.compile(r"^(\s*)import\s+([\w\.]+)(\s+as\s+\w+)?\s*$")
+        def _loc(node: ast.AST) -> tuple:
+            start = getattr(node, "lineno", None)
+            end = getattr(node, "end_lineno", start)
+            return start, end
 
-        for line in lines:
-            from_match = from_re.match(line)
-            if from_match:
-                indent, module, _names = from_match.groups()
+        for node in tree.body:
+            if isinstance(node, ast.ImportFrom):
+                module = node.module or ""
                 root = module.split(".")[0]
                 if root == "source_module":
                     has_source_import = True
-                    fixed_lines.append(line)
-                elif _is_known_import(module):
-                    fixed_lines.append(line)
-                else:
-                    has_source_import = True
-                    fixed_lines.append(f"{indent}from source_module import *")
+                    continue
+                if _is_known_import(module):
+                    continue
+                # Unknown module -> redirect to wildcard from source_module
+                has_source_import = True
+                start, end = _loc(node)
+                if start is not None:
+                    replacements.append((start, end, "from source_module import *"))
                 continue
 
-            import_match = import_re.match(line)
-            if import_match:
-                indent, module, _alias = import_match.groups()
-                root = module.split(".")[0]
-                if root == "source_module":
-                    has_source_import = True
-                    fixed_lines.append(line)
-                elif _is_known_import(module):
-                    fixed_lines.append(line)
-                else:
-                    has_source_import = True
-                    fixed_lines.append(f"{indent}from source_module import *")
-                continue
+            if isinstance(node, ast.Import):
+                # `import a, b as c` -> keep known roots, replace unknown ones
+                kept = []
+                unknown = False
+                for alias in node.names:
+                    module = alias.name
+                    root = module.split(".")[0]
+                    if root == "source_module":
+                        has_source_import = True
+                        kept.append(alias)
+                    elif _is_known_import(module):
+                        kept.append(alias)
+                    else:
+                        unknown = True
+                if not unknown:
+                    continue
+                has_source_import = True
+                new_lines: list = []
+                for alias in kept:
+                    seg = f"import {alias.name}"
+                    if alias.asname:
+                        seg += f" as {alias.asname}"
+                    new_lines.append(seg)
+                new_lines.append("from source_module import *")
+                start, end = _loc(node)
+                if start is not None:
+                    replacements.append((start, end, "\n".join(new_lines)))
 
-            fixed_lines.append(line)
+        if not replacements:
+            if not has_source_import:
+                return "from source_module import *\n\n" + test_code
+            return test_code
 
-        result = "\n".join(fixed_lines)
-        if not has_source_import:
+        # Apply replacements bottom-up so line numbers stay valid.
+        source_lines = test_code.splitlines()
+        for start, end, new_text in sorted(replacements, key=lambda r: -r[0]):
+            source_lines[start - 1:end] = [new_text]
+
+        result = "\n".join(source_lines)
+        if not has_source_import and "from source_module import *" not in result:
             result = "from source_module import *\n\n" + result
         return result
     

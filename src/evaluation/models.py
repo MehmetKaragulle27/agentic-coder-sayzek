@@ -43,6 +43,13 @@ class EvalMetrics(BaseModel):
     failed: int = 0
     errored: int = 0
     pass_rate: float = 0.0
+    # Aggregate test-level metrics. ``test_pass_rate`` = pooled
+    # tests_passed / tests_run across all cases. This is the metric to
+    # report for multi-file projects where the all-or-nothing case-level
+    # ``pass_rate`` collapses 80%-passing runs to "0% passed".
+    total_tests_run: int = 0
+    total_tests_passed: int = 0
+    test_pass_rate: float = 0.0
     avg_coverage: Optional[float] = None
     avg_iterations: float = 0.0
     avg_time: float = 0.0
@@ -57,6 +64,12 @@ class EvalMetrics(BaseModel):
         passed = sum(1 for r in results if r.passed)
         errored = sum(1 for r in results if r.error)
         failed = total - passed
+
+        total_tests_run = sum(r.tests_run for r in results)
+        total_tests_passed = sum(r.tests_passed for r in results)
+        test_pass_rate = (
+            total_tests_passed / total_tests_run if total_tests_run else 0.0
+        )
 
         coverages = [r.coverage for r in results if r.coverage is not None]
         avg_cov = sum(coverages) / len(coverages) if coverages else None
@@ -80,6 +93,9 @@ class EvalMetrics(BaseModel):
             failed=failed,
             errored=errored,
             pass_rate=passed / total,
+            total_tests_run=total_tests_run,
+            total_tests_passed=total_tests_passed,
+            test_pass_rate=test_pass_rate,
             avg_coverage=avg_cov,
             avg_iterations=avg_iter,
             avg_time=avg_time,
@@ -95,8 +111,13 @@ class EvalMetrics(BaseModel):
             f"| Passed | {self.passed} |",
             f"| Failed | {self.failed} |",
             f"| Errored | {self.errored} |",
-            f"| Pass rate | {self.pass_rate:.1%} |",
+            f"| Pass rate (case-level) | {self.pass_rate:.1%} |",
         ]
+        if self.total_tests_run:
+            lines.append(
+                f"| Tests passed | {self.total_tests_passed}/{self.total_tests_run} "
+                f"({self.test_pass_rate:.1%}) |"
+            )
         if self.avg_coverage is not None:
             lines.append(f"| Avg coverage | {self.avg_coverage:.1f}% |")
         lines.append(f"| Avg iterations | {self.avg_iterations:.2f} |")

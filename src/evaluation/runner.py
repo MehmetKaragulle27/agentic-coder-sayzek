@@ -58,12 +58,28 @@ class BenchmarkRunner:
             gates = report.get("gates", [])
             coverage_val = report.get("coverage")
 
+            # Prefer the *actual* pytest counts the sandbox parsed; fall
+            # back to the LLM's declared test_functions only when the
+            # sandbox didn't run (e.g. pre-sandbox failure). This makes
+            # the per-case `tests_passed` field a real signal usable for
+            # paper-grade metrics like "mean per-case test pass rate"
+            # instead of an all-or-nothing flag that collapses an
+            # 82-percent-passing case to "0 passed".
+            sb_run = state.get("sandbox_tests_run")
+            sb_pass = state.get("sandbox_tests_passed")
+            declared = len(state.get("test_functions") or [])
+            tests_run = sb_run if sb_run is not None else declared
+            if sb_pass is not None:
+                tests_passed = sb_pass
+            else:
+                tests_passed = declared if state.get("status") == "success" else 0
+
             return EvalResult(
                 case_id=case.id,
                 passed=state.get("status") == "success",
                 elapsed_seconds=round(elapsed, 2),
-                tests_run=len(state.get("test_functions") or []),
-                tests_passed=len(state.get("test_functions") or []) if state.get("status") == "success" else 0,
+                tests_run=tests_run,
+                tests_passed=tests_passed,
                 coverage=coverage_val,
                 iterations=state.get("retry_count", 0) + 1,
                 gate_results=gates,

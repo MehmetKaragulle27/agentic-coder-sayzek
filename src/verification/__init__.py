@@ -8,6 +8,7 @@ from .dependency import DependencyValidator
 from .judge import SastJudge
 from .explanation_judge import ExplanationJudge
 from .complexity import ComplexityValidator
+from .relevance import RelevanceValidator
 from .models import GateResult, Finding, VerificationReport, Severity, JudgeVerdict
 
 __all__ = [
@@ -20,6 +21,7 @@ __all__ = [
     "SastJudge",
     "ExplanationJudge",
     "ComplexityValidator",
+    "RelevanceValidator",
     "GateResult",
     "Finding",
     "VerificationReport",
