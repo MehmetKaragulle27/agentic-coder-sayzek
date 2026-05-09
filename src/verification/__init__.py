@@ -9,6 +9,7 @@ from .judge import SastJudge
 from .explanation_judge import ExplanationJudge
 from .complexity import ComplexityValidator
 from .relevance import RelevanceValidator
+from .dlp_ml import DlpValidator
 from .models import GateResult, Finding, VerificationReport, Severity, JudgeVerdict
 
 __all__ = [
@@ -22,6 +23,7 @@ __all__ = [
     "ExplanationJudge",
     "ComplexityValidator",
     "RelevanceValidator",
+    "DlpValidator",
     "GateResult",
     "Finding",
     "VerificationReport",

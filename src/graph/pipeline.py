@@ -18,6 +18,7 @@ from ..agents.unit_test import UnitTestAgent, RepairContext
 from ..agents.ui_test import UITestAgent, UIRepairContext
 from ..agents.jest_test import JestTestAgent
 from ..agents.explanation import ExplanationAgent, ExplanationRepairContext
+from ..agents.guardrail import GuardrailAgent
 from ..verification.sandbox import SandboxExecutor
 from ..verification.ui_sandbox import UITestExecutor
 from ..verification.js_sandbox import JsSandboxExecutor
@@ -27,6 +28,7 @@ from ..verification.judge import SastJudge
 from ..verification.explanation_judge import ExplanationJudge
 from ..verification.complexity import ComplexityValidator
 from ..verification.relevance import RelevanceValidator
+from ..verification.dlp_ml import DlpValidator
 from ..verification.models import GateResult, VerificationReport, Finding, Severity
 from ..utils.logging import AuditLogger
 from ..config import Config, get_llm, get_role_llm
@@ -105,6 +107,7 @@ def create_pipeline(config: Optional[Config] = None):
     # fallback chains. Both default to the same primary if the role-based
     # env vars aren't configured (legacy behavior).
     llm = get_role_llm(config, "coding")
+    guardrail_agent = GuardrailAgent()
     router_agent = RouterAgent()
     unit_test_agent = UnitTestAgent(llm)
     jest_test_agent = JestTestAgent(llm)
@@ -142,7 +145,20 @@ def create_pipeline(config: Optional[Config] = None):
         min_relevance_signals=config.relevance.min_signals,
     ) if config.relevance.enabled else None
 
+    dlp_validator = DlpValidator(ml_enabled=True)
+
     # ── Nodes ──────────────────────────────────────────────────────────
+
+    def guardrail_node(state: PipelineState) -> PipelineState:
+        result = guardrail_agent.check_prompt(state["user_request"])
+        if not result.is_safe:
+            return {
+                **state,
+                "status": "unsafe_prompt",
+                "error_message": f"Prompt blocked by Guardrail: {result.reason}",
+                "verification_passed": False
+            }
+        return state
 
     def router_node(state: PipelineState) -> PipelineState:
         routing = router_agent.route(
@@ -285,16 +301,24 @@ def create_pipeline(config: Optional[Config] = None):
                 source_code=state["code_input"],
             )
 
-        with ThreadPoolExecutor(max_workers=3) as pool:
+        def run_dlp():
+            if not dlp_validator:
+                return GateResult(gate_name="dlp", passed=True, findings=[])
+            combined = (state["code_input"] or "") + "\n\n" + (test_code or "")
+            return dlp_validator.validate(combined)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
             sast_future = pool.submit(run_sast)
             dep_future = pool.submit(run_deps)
             rel_future = pool.submit(run_relevance)
+            dlp_future = pool.submit(run_dlp)
             sast_result = sast_future.result()
             dep_result = dep_future.result()
             rel_result = rel_future.result()
+            dlp_result = dlp_future.result()
 
-        gate_results = [sast_result.model_dump(), dep_result.model_dump()]
-        static_passed = sast_result.passed and dep_result.passed
+        gate_results = [sast_result.model_dump(), dep_result.model_dump(), dlp_result.model_dump()]
+        static_passed = sast_result.passed and dep_result.passed and dlp_result.passed
         if rel_result is not None:
             gate_results.append(rel_result.model_dump())
             static_passed = static_passed and rel_result.passed
@@ -630,6 +654,7 @@ def create_pipeline(config: Optional[Config] = None):
 
     workflow = StateGraph(PipelineState)
 
+    workflow.add_node("guardrail", guardrail_node)
     workflow.add_node("router", router_node)
     workflow.add_node("generate", generate_node)
     workflow.add_node("verify_static", verify_static_node)
@@ -639,7 +664,17 @@ def create_pipeline(config: Optional[Config] = None):
     workflow.add_node("repair", repair_node)
     workflow.add_node("output", output_node)
 
-    workflow.set_entry_point("router")
+    def route_from_guardrail(state: PipelineState):
+        if state.get("status") == "unsafe_prompt":
+            return "output"
+        return "router"
+
+    workflow.set_entry_point("guardrail")
+    workflow.add_conditional_edges(
+        "guardrail",
+        route_from_guardrail,
+        {"router": "router", "output": "output"},
+    )
     workflow.add_edge("router", "generate")
     workflow.add_edge("generate", "verify_static")
     workflow.add_edge("verify_static", "judge")
