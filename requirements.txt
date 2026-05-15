@@ -1,47 +1,46 @@
 # LLM Agent Platform - Phase 1 & 2 Dependencies
-
 # LangChain and LangGraph for orchestration
 langchain>=0.3.0
 langgraph>=0.2.0
 langchain-core>=0.3.0
-
 # LLM Providers (free tiers)
 langchain-groq>=0.2.0
 httpx>=0.27.0
-
 # Docker SDK for sandbox execution
 docker>=7.0.0
-
 # Testing frameworks
 pytest>=8.0.0
 coverage>=7.0.0
 pytest-cov>=4.0.0
-
 # SAST tools (Phase 2)
 semgrep>=1.60.0
 bandit>=1.7.0
-
 # Playwright E2E testing (Phase 3)
 playwright>=1.51.0
 pytest-playwright>=0.5.0
-
 # CLI
 click>=8.0.0
-
 # Data validation
 pydantic>=2.0.0
-
 # Configuration
 python-dotenv>=1.0.0
-
 # Utilities
 rich>=13.0.0
-
 # Phase 6: Evaluation & Benchmarking
 gitpython>=3.1.0
 huggingface_hub>=0.20.0
-
 # Phase 7: ML Security (DLP & Guardrails)
 transformers>=4.30.0
 torch>=2.0.0
 langchain-community>=0.3.0
+# Local AI / H200 model support
+transformers>=4.40.0
+accelerate>=0.30.0
+sentencepiece>=0.2.0
+huggingface_hub>=0.23.0
+# Optional training stack
+datasets>=2.19.0
+peft>=0.11.0
+trl>=0.9.0
+scikit-learn>=1.4.0
+# Dataset / training stack

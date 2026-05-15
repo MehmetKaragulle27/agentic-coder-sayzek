@@ -1,53 +1,65 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Virtual environments
-venv/
-ENV/
-env/
 .venv/
+venv/
+env/
 
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-
-# Environment variables
+# Secrets
 .env
+.env.*
+!.env.example
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
 
-# Logs
+# Hugging Face / caches
+_hf_cache/
+.cache/
+*/_hf_cache/
+Guvenlik/_hf_cache/
+Güvenlik/_hf_cache/
+
+# Local security artifacts
+Guvenlik
+Guvenlik/
+Güvenlik
+Güvenlik/
+
+# Large model artifacts
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Training artifacts
+checkpoint-*/
+*.jsonl
+*.parquet
+*.arrow
 *.log
-audit_logs/
 
-# Test artifacts
-.pytest_cache/
-.coverage
-htmlcov/
-.tox/
+# Local backups / temporary files
+.gitignore.backup
+*.backup
+*_backup.py
+*_before_*.py
 
-# Docker
-sandbox_workdir/
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
 
-# Temporary files
-tmp/
-temp/
+# Streamlit secrets
+.streamlit/secrets.toml
