@@ -1,0 +1,27 @@
+{
+  "metrics": {
+    "eval_loss": 0.0019111956935375929,
+    "eval_accuracy": 0.9994444444444445,
+    "eval_precision_sql_risk": 0.998805256869773,
+    "eval_recall_sql_risk": 1.0,
+    "eval_f1_sql_risk": 0.9994022713687986,
+    "eval_runtime": 2.3304,
+    "eval_samples_per_second": 772.393,
+    "eval_steps_per_second": 24.459,
+    "epoch": 8.0
+  },
+  "confusion_matrix": [
+    [
+      963,
+      1
+    ],
+    [
+      0,
+      836
+    ]
+  ],
+  "label_mapping": {
+    "0": "benign_sql",
+    "1": "sql_risk"
+  }
+}

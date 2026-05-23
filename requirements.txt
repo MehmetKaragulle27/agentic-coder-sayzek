@@ -44,3 +44,6 @@ peft>=0.11.0
 trl>=0.9.0
 scikit-learn>=1.4.0
 # Dataset / training stack
+protobuf>=4.25.0
+tiktoken>=0.7.0
+setuptools<82

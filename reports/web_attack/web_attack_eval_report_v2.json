@@ -1,0 +1,27 @@
+{
+  "metrics": {
+    "eval_loss": 0.011875349096953869,
+    "eval_accuracy": 0.9949353692644947,
+    "eval_precision_attack": 0.9957460732984293,
+    "eval_recall_attack": 0.9933083074914314,
+    "eval_f1_attack": 0.9945256965438353,
+    "eval_runtime": 42.6937,
+    "eval_samples_per_second": 309.858,
+    "eval_steps_per_second": 4.848,
+    "epoch": 2.0
+  },
+  "confusion_matrix": [
+    [
+      7076,
+      26
+    ],
+    [
+      41,
+      6086
+    ]
+  ],
+  "label_mapping": {
+    "0": "benign",
+    "1": "web_attack"
+  }
+}

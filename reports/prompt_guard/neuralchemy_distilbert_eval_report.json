@@ -1,0 +1,27 @@
+{
+  "metrics": {
+    "eval_loss": 0.27579957246780396,
+    "eval_accuracy": 0.9585987261146497,
+    "eval_precision_unsafe": 0.9605026929982047,
+    "eval_recall_unsafe": 0.9692028985507246,
+    "eval_f1_unsafe": 0.9648331830477908,
+    "eval_runtime": 1.821,
+    "eval_samples_per_second": 517.295,
+    "eval_steps_per_second": 16.474,
+    "epoch": 15.0
+  },
+  "confusion_matrix": [
+    [
+      368,
+      22
+    ],
+    [
+      17,
+      535
+    ]
+  ],
+  "label_mapping": {
+    "0": "safe",
+    "1": "unsafe"
+  }
+}
